@@ -56,9 +56,10 @@ GAUSS_WIDTH   = CP_FLOAT(3)
 LORENTZ_WIDTH = CP_FLOAT(8)
 
 N_STEPS = CP_UINT(X_THREADS)
+N_SPATIAL = CP_UINT(64)
 
 @jit.rawkernel()
-def particle_kernel(intersect, envelope, particles, THX, THY, f_th, w0, beta_ff, sigma_lz, t0, t1, dvx, dvy):#, debug, xy_debug): 
+def particle_kernel(intersect, envelope, spatial, particles, THX, THY, f_th, w0, beta_ff, sigma_lz, t0, t1, dvx, dvy, sx0, sx1, sy0, sy1):#, debug, xy_debug):
     # Make sure arguments and arrays are of type CP_FLOAT
     z_rayleigh = 2 * w0 * w0 * ( CP_ONE + beta_ff )
     
@@ -110,6 +111,30 @@ def particle_kernel(intersect, envelope, particles, THX, THY, f_th, w0, beta_ff,
             #     debug[p_idx, step_idx, 3] = z
             jit.atomic_add(envelope, env_idx,     f_cur * (CP_ONE - env_fac))
             jit.atomic_add(envelope, env_idx + 1, f_cur * env_fac)
+
+        # Transverse (x, y) spatial distribution of emission, deposited with
+        # bilinear weights into a fixed-resolution grid -- mirrors the
+        # time_envelope mechanism above, just in 2 dimensions.
+        if x >= sx0 and x < sx1 and y >= sy0 and y < sy1:
+            nsx = spatial.shape[0]
+            nsy = spatial.shape[1]
+            sx_fac = nsx * ( x - sx0 ) / ( sx1 - sx0 )
+            sy_fac = nsy * ( y - sy0 ) / ( sy1 - sy0 )
+            sx_idx = CP_UINT( cp.floor( sx_fac ) )
+            sy_idx = CP_UINT( cp.floor( sy_fac ) )
+            sx_fac = cp.remainder(sx_fac, CP_ONE)
+            sy_fac = cp.remainder(sy_fac, CP_ONE)
+            jit.atomic_add(spatial, (sx_idx, sy_idx),
+                           f_cur * (CP_ONE - sx_fac) * (CP_ONE - sy_fac))
+            if sx_idx + 1 < nsx:
+                jit.atomic_add(spatial, (sx_idx + 1, sy_idx),
+                               f_cur * sx_fac * (CP_ONE - sy_fac))
+            if sy_idx + 1 < nsy:
+                jit.atomic_add(spatial, (sx_idx, sy_idx + 1),
+                               f_cur * (CP_ONE - sx_fac) * sy_fac)
+            if sx_idx + 1 < nsx and sy_idx + 1 < nsy:
+                jit.atomic_add(spatial, (sx_idx + 1, sy_idx + 1),
+                               f_cur * sx_fac * sy_fac)
 
         jit.atomic_add(intersect, xy_idx , f_cur)
 
@@ -607,19 +632,51 @@ class Compton:
         
         self.intersection  = cp.zeros((nx, ny), dtype=CP_FLOAT).flatten()
         self.time_envelope = cp.zeros((N_STEPS,), dtype=CP_FLOAT)
+
+        # Transverse spatial-distribution grid, dimensionless (k0-scaled)
+        # bounds sized the same way as the theta window above: a few sigma
+        # of whichever of the electron beam / laser waist is larger, since
+        # that bounds where the local laser intensity (and hence emission
+        # probability) is non-negligible.
+        sx_half = CP_FLOAT(GAUSS_WIDTH * self.k0_las * max(self.sigma_ex, self.sigma_lr0))
+        sy_half = CP_FLOAT(GAUSS_WIDTH * self.k0_las * max(self.sigma_ey, self.sigma_lr0))
+        sx0_, sx1_ = -sx_half, sx_half
+        sy0_, sy1_ = -sy_half, sy_half
+        self.spatial_envelope = cp.zeros((N_SPATIAL, N_SPATIAL), dtype=CP_FLOAT)
+
         #debug =  cp.zeros((particles_amount, N_STEPS,4), dtype=CP_FLOAT) * cp.nan
         finish = cp.cuda.Event()
-        particle_kernel[(particles_amount, nx*ny), N_STEPS](self.intersection, self.time_envelope, particles, self.THX.flatten(), self.THY.flatten(), f_th.flatten(), CP_FLOAT(self.k0_las * self.sigma_lr0), CP_FLOAT(self.beta_ff), zT, t_start, t_end, dvx, dvy)#, debug, CP_UINT(debug_idx))
-                
+        particle_kernel[(particles_amount, nx*ny), N_STEPS](self.intersection, self.time_envelope, self.spatial_envelope, particles, self.THX.flatten(), self.THY.flatten(), f_th.flatten(), CP_FLOAT(self.k0_las * self.sigma_lr0), CP_FLOAT(self.beta_ff), zT, t_start, t_end, dvx, dvy, sx0_, sx1_, sy0_, sy1_)#, debug, CP_UINT(debug_idx))
+
         finish.record()
         finish.synchronize()
         v_rel = 2.0
-        
+
         coef = CP_FLOAT( sigma_T * self.k0_las**2 * v_rel * self.N_e * self.N_l * (z_weight * dsx * dsy).get() / ( 2.0 * np.pi * sigma_thx * sigma_thy ) )
         self.intersection *= coef
         self.intersection = self.intersection.reshape((nx, ny))
         self.time_envelope *= coef * N_STEPS / ( t_end - t_start )
-        
+
+        # Areal density [photons / cm^2]. Note: `coef` above bakes in the
+        # angular Gaussian-profile normalization (the 1/(2 pi sigma_thx
+        # sigma_thy) term), which does not carry over to a spatial density
+        # -- reusing it here would be dimensionally wrong. Instead,
+        # self-normalize against calculate_total()'s already-trusted total
+        # yield: spatial_envelope's raw accumulation is proportional to the
+        # exact same underlying sum as intersection's (both are sums of the
+        # kernel's f_cur over the full (particle, angle, time) grid, just
+        # partitioned differently), so rescaling it to reproduce the same
+        # total when integrated over its bin area is correct by construction
+        # and doesn't require re-deriving a new physical prefactor.
+        total_yield_now = float((self.intersection.sum() * self.dtheta_x * self.dtheta_y).get())
+        dx_cm = float(sx1_ - sx0_) / float(N_SPATIAL) / self.k0_las
+        dy_cm = float(sy1_ - sy0_) / float(N_SPATIAL) / self.k0_las
+        raw_spatial_sum = float(self.spatial_envelope.sum().get())
+        if raw_spatial_sum > 0:
+            self.spatial_envelope *= CP_FLOAT(total_yield_now / (raw_spatial_sum * dx_cm * dy_cm))
+        self.spatial_x_edges = cp.linspace(sx0_, sx1_, N_SPATIAL + 1, dtype=CP_FLOAT) / self.k0_las
+        self.spatial_y_edges = cp.linspace(sy0_, sy1_, N_SPATIAL + 1, dtype=CP_FLOAT) / self.k0_las
+
         ts = cp.linspace(t_start, t_end, N_STEPS, dtype=CP_FLOAT)
 
         self.env_ts = ts / self.omega_las
