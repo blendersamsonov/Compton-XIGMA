@@ -25,6 +25,10 @@ table (`intersection`) plus a 2D quadrature per output point, the new path
 to a 4D overlap table (`H`) plus a 3D quadrature (`theta_x, theta_y, a0`)
 per output point.
 
+`gui_adapter.py` wraps the legacy path (`core.Compton`) behind a
+model-agnostic contract consumed by a sibling GUI repo, `compton-gui` --
+see "Architecture: GUI integration" below.
+
 ## Current state
 
 - **Legacy path**: `calculate_total()`, `calculate_spectrum()`,
@@ -288,6 +292,65 @@ without trusting Stage 2 itself:
   session (see "Known bugs") -- normalisation root-caused and corrected; a
   small, deliberately-deferred `~2*pi` residual remains against
   `angle_integrated_spectrum` in grid-integrated comparisons.
+
+## Architecture: GUI integration (`gui_adapter.py`)
+
+`gui_adapter.py` is the bridge from this package to a sibling repo,
+`compton-gui` -- a standalone, model-agnostic Tkinter GUI that plugs in
+physics engines through a `ModelAdapter` contract (`model_api.py` there)
+rather than a hardcoded import. `compton-gui` does `from xigma_i import
+gui_adapter`; there is no dependency in the other direction, and this
+package does not import anything from `compton-gui`.
+
+- **Never imports `cupy`/`core` at module scope** -- only inside
+  `available()`, `run_simulation()`, and `spectrum_in_angular_range()` --
+  so `import xigma_i.gui_adapter` degrades gracefully when cupy/CUDA isn't
+  installed; the GUI wraps that import in `try/except` and shows the model
+  greyed-out instead of crashing.
+- **Defines its own local result dataclasses** (`BinnedSpectrum`,
+  `BinnedAngularSpectrum`, `BinnedTemporalEnvelope`,
+  `BinnedSpatialDistribution`, `AngularRangeSpectrumResult`) rather than
+  importing the structurally-identical ones from `compton_gui.model_api`,
+  so this package doesn't have to depend on the GUI project. They are
+  duck-type compatible but **not the same class** as `model_api`'s --
+  `compton-gui`'s own `CLAUDE.md` documents an `isinstance`-based bug this
+  caused there; don't "fix" it by importing `compton_gui` here, the
+  decoupling is intentional.
+- `Config` mirrors `dfe5_compton_mc.Config`'s (the other engine plugged
+  into the same GUI) field names and SI units wherever a physical mapping
+  exists, so the GUI's model-agnostic spread-estimate formula keeps
+  working regardless of which model is active; converts to this package's
+  CGS convention at the `set_*_parameters` call boundary. `crossing_angle`
+  must be `0.0` (`core.Compton` is head-on only). `quantum` is accepted
+  for interface symmetry but has no effect -- use `emulate_nonlinearity`
+  for this package's actual (and unrelated) nonlinearity axis.
+- `run_simulation` clamps the GUI's `n_mc` field into `[512, 8192]` before
+  passing it to `calculate_intersection` as `particles_amount` -- it's a
+  quadrature-sampling density for the beam-laser overlap integral here,
+  not a per-electron event count like it is for the other engine, and
+  that engine's GUI default (`200,000`) would be a catastrophic kernel
+  launch under this package's `O(particles_amount * theta_num**2)` cost
+  model.
+- `XigmaAdapter` caches the built `Compton` instance (plus `gamma_0`/
+  `sigma_gamma_0`) on the returned `XigmaResults` so
+  `spectrum_in_angular_range()` can issue a fresh, on-demand
+  `calculate_angular_spectrum()` call over a user-picked angular window
+  without re-running the whole simulation.
+- Only `core.Compton`'s legacy analytic-energy path is wired up here --
+  the new tabulated-energy path (`particles.py`/`deposition.py`/
+  `spectrum4d.py`) is not exposed through this adapter.
+- **Not covered by this repo's tests** (there are none here) -- validated
+  via the sibling `compton-gui` repo's `scripts/headless_test.py`, which
+  drives the exact `discover_models() -> params_to_config() -> run() ->
+  validate_results()` sequence the GUI's own "Start" button calls, plus
+  the temporal/spatial/angular-distribution fields. Run it after touching
+  this file. See `compton-gui/CLAUDE.md` for how to run it (needs the
+  `core` conda env for cupy/GPU on this dev machine).
+- `compton-gui`'s `bootstrap.py` puts this package's `src/` on `sys.path`
+  at runtime (it isn't pip-installed) by auto-discovering a sibling
+  directory containing `src/xigma_i/gui_adapter.py`, overridable via
+  `COMPTON_GUI_XIGMA_SRC` -- see that file if imports of `xigma_i` from
+  the GUI process ever fail to resolve.
 
 ## Conventions
 
